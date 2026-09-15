@@ -14,7 +14,7 @@
 НЕ запускать на сервере, где с того же IP уже ходит в Steam другой бот.
 
 Переменные окружения (все необязательные):
-  MODE                  ip | check | full            (по умолчанию full)
+  MODE                  ip | check | full | simulate (по умолчанию full)
   ENDPOINT              search | priceoverview | mixed (search; mixed = по очереди оба)
   RATES                 ступени, запросов/мин        (6,10,15,20,30,45,60)
   STAGE_MINUTES         длительность ступени         (4)
@@ -24,6 +24,16 @@
   KEEP_ALIVE            1 = не завершаться после отчёта (для Northflank Service)
   TG_BOT_TOKEN, TG_CHAT_ID  прислать отчёт в Telegram
   LABEL                 имя точки в отчёте, например nf-1 / oracle-a1
+
+Режим simulate — ведёт себя как будущий воркер бота и меряет реальную отдачу:
+  частота по каждому эндпоинту своя; при 429 эндпоинт уходит на паузу COOLDOWN_MINUTES
+  и частота ×0.7; каждые RAISE_EVERY_MINUTES без 429 частота +RAISE_STEP (до MAX_RATE).
+  SIM_MINUTES           длительность                 (60)
+  START_RATE            стартовая частота, в мин     (8)
+  MAX_RATE / MIN_RATE   границы частоты              (14 / 2)
+  COOLDOWN_MINUTES      пауза после 429              (3)
+  RAISE_EVERY_MINUTES   как часто ускоряться         (5)
+  RAISE_STEP            шаг ускорения                (1)
 
 Эндпоинты:
   search         /market/search/render?norender=1 — sell_listings и sell_price, один запрос на предмет.
@@ -75,6 +85,13 @@ KEEP_ALIVE = os.getenv("KEEP_ALIVE", "0") == "1"
 TG_TOKEN = os.getenv("TG_BOT_TOKEN", "")
 TG_CHAT = os.getenv("TG_CHAT_ID", "")
 LABEL = os.getenv("LABEL", "")
+SIM_MIN = env_float("SIM_MINUTES", 60)
+START_RATE = env_float("START_RATE", 8)
+MAX_RATE = env_float("MAX_RATE", 14)
+MIN_RATE = env_float("MIN_RATE", 2)
+COOLDOWN_MIN = env_float("COOLDOWN_MINUTES", 3)
+RAISE_EVERY_MIN = env_float("RAISE_EVERY_MINUTES", 5)
+RAISE_STEP = env_float("RAISE_STEP", 1)
 
 T0 = time.time()
 CURL = shutil.which("curl")
@@ -280,6 +297,103 @@ def recover(fetch, meter):
     return None
 
 
+def simulate(fetch):
+    """Работа как у настоящего воркера: не останавливаемся на 429, а притормаживаем и продолжаем."""
+    eps = ["search", "priceoverview"] if ENDPOINT == "mixed" else [ENDPOINT]
+    start = time.time()
+    end = start + SIM_MIN * 60
+    st = {ep: {"rate": START_RATE, "next": start + k * 3, "cool_until": 0.0, "last_change": start,
+               "ok": 0, "limit": 0, "err": 0, "err_row": 0, "cool_sec": 0.0,
+               "i": random.randrange(len(ITEMS))}
+          for k, ep in enumerate(eps)}
+    buckets = []  # по 10 минут: {ep: {"ok": n, "limit": n}}
+    R["sim"] = {"config": {"minutes": SIM_MIN, "start_rate": START_RATE, "max_rate": MAX_RATE,
+                           "min_rate": MIN_RATE, "cooldown_min": COOLDOWN_MIN,
+                           "raise_every_min": RAISE_EVERY_MIN, "raise_step": RAISE_STEP},
+                "endpoints": {}, "buckets": buckets}
+    next_summary = start + 300
+
+    def publish():
+        elapsed_h = max(time.time() - start, 1e-6) / 3600
+        R["sim"]["elapsed_min"] = round(elapsed_h * 60, 1)
+        for ep, s in st.items():
+            R["sim"]["endpoints"][ep] = {
+                "ok": s["ok"], "limit_429": s["limit"], "errors": s["err"],
+                "cooldown_min": round(s["cool_sec"] / 60, 1), "final_rate": round(s["rate"], 1),
+                "ok_per_hour": round(s["ok"] / elapsed_h)}
+        R["sim"]["ok_per_hour_total"] = sum(e["ok_per_hour"] for e in R["sim"]["endpoints"].values())
+
+    log(f"simulate: {', '.join(eps)}, старт {START_RATE:g}/мин на эндпоинт, потолок {MAX_RATE:g}, "
+        f"{SIM_MIN:g} мин")
+    try:
+        while True:
+            now = time.time()
+            for ep, s in st.items():
+                if (now >= s["cool_until"] and s["rate"] < MAX_RATE
+                        and now - s["last_change"] >= RAISE_EVERY_MIN * 60):
+                    s["rate"] = min(MAX_RATE, s["rate"] + RAISE_STEP)
+                    s["last_change"] = now
+                    log(f"  {ep}: {RAISE_EVERY_MIN:g} мин без 429 -> {s['rate']:.1f}/мин")
+
+            ep = min(st, key=lambda e: max(st[e]["next"], st[e]["cool_until"]))
+            s = st[ep]
+            wake = max(s["next"], s["cool_until"])
+            if wake >= end:
+                break
+            if wake > now:
+                time.sleep(wake - now)
+                continue  # пересчитать ускорения и выбор эндпоинта после сна
+
+            code, body, _ = fetch(endpoint_url(ITEMS[s["i"] % len(ITEMS)], ep))
+            s["i"] += 1
+            t = time.time()
+            idx = int((t - start) // 600)
+            while len(buckets) <= idx:
+                buckets.append({e: {"ok": 0, "limit": 0} for e in eps})
+            kind = classify(code, body)
+            if kind == "ok":
+                s["ok"] += 1
+                s["err_row"] = 0
+                buckets[idx][ep]["ok"] += 1
+                s["next"] = t + 60.0 / s["rate"] * random.uniform(0.85, 1.15)
+            elif kind == "limit":
+                s["limit"] += 1
+                buckets[idx][ep]["limit"] += 1
+                old = s["rate"]
+                s["rate"] = max(MIN_RATE, s["rate"] * 0.7)
+                s["cool_until"] = t + COOLDOWN_MIN * 60
+                s["cool_sec"] += min(COOLDOWN_MIN * 60, max(end - t, 0))
+                s["last_change"] = s["cool_until"]
+                s["next"] = s["cool_until"]
+                log(f"  {ep}: 429 -> пауза {COOLDOWN_MIN:g} мин, частота {old:.1f} -> {s['rate']:.1f}/мин")
+            else:
+                s["err"] += 1
+                s["err_row"] += 1
+                s["next"] = t + 60.0 / s["rate"]
+                log(f"  {ep}: ошибка HTTP {code}: {body[:120]!r}")
+                if s["err_row"] >= 10:
+                    log(f"  {ep}: 10 ошибок подряд — пауза 5 мин")
+                    s["cool_until"] = t + 300
+                    s["err_row"] = 0
+
+            if t >= next_summary:
+                next_summary += 300
+                publish()
+                parts = [f"{e}: {v['ok']} ok, 429×{v['limit_429']}, {st[e]['rate']:.1f}/мин"
+                         for e, v in R["sim"]["endpoints"].items()]
+                log(f"итог за {R['sim']['elapsed_min']:g} мин — " + " | ".join(parts))
+    finally:
+        publish()
+
+
+def user_capacity_lines(per_hour):
+    lines = [f"Пользователей на эту точку ({LOTS} лота, реалистично ×2 за совпадения):"]
+    for interval in (15, 30, 60):
+        pess = per_hour / (LOTS * 60 / interval)
+        lines.append(f"  раз в {interval} мин: {pess:.0f} (пессим.) … {pess * 2:.0f} (реалист.)")
+    return lines
+
+
 # ---------------------------------------------------------------- отчёт
 
 def build_report():
@@ -319,10 +433,22 @@ def build_report():
         lines.append(f"БЕЗОПАСНО: {safe:.1f} запр/мин ≈ {per_hour:.0f} запр/час")
         if R.get("limit_not_reached"):
             lines.append("  (лимит не достигнут — реальный потолок выше)")
-        lines.append(f"Пользователей на эту точку ({LOTS} лота, реалистично ×2 за совпадения):")
-        for interval in (15, 30, 60):
-            pess = per_hour / (LOTS * 60 / interval)
-            lines.append(f"  раз в {interval} мин: {pess:.0f} (пессим.) … {pess * 2:.0f} (реалист.)")
+        lines += user_capacity_lines(per_hour)
+    elif MODE == "simulate" and "sim" in R:
+        sim = R["sim"]
+        lines.append(f"Симуляция воркера: {sim.get('elapsed_min')} мин, старт {START_RATE:g}/мин, "
+                     f"потолок {MAX_RATE:g}, пауза после 429 {COOLDOWN_MIN:g} мин")
+        for ep, v in sim["endpoints"].items():
+            lines.append(f"  {ep}: {v['ok']} успешных ({v['ok_per_hour']}/час), 429×{v['limit_429']}, "
+                         f"ошибок {v['errors']}, на паузе {v['cooldown_min']} мин, "
+                         f"частота в конце {v['final_rate']}/мин")
+        lines.append("По 10 минут (успешные / 429):")
+        for n, b in enumerate(sim["buckets"]):
+            cells = " | ".join(f"{ep} {c['ok']}/{c['limit']}" for ep, c in b.items())
+            lines.append(f"  {n * 10:>3}–{n * 10 + 10} мин: {cells}")
+        total = sim.get("ok_per_hour_total", 0)
+        lines.append(f"РЕАЛЬНАЯ ОТДАЧА: ≈ {total} успешных проверок в час")
+        lines += user_capacity_lines(total)
     elif MODE == "full":
         lines.append("Безопасная частота не определена (см. ступени выше)")
     lines.append(f"Длительность теста: {(time.time() - T0) / 60:.0f} мин")
@@ -356,8 +482,11 @@ def finish():
 # ---------------------------------------------------------------- main
 
 def main():
-    log(f"режим {MODE}, эндпоинт {ENDPOINT}, ступени {RATES}, ступень {STAGE_MIN:g} мин, "
-        f"удержание {SUSTAIN_MIN:g} мин")
+    if MODE == "simulate":
+        log(f"режим simulate, эндпоинт {ENDPOINT}, {SIM_MIN:g} мин")
+    else:
+        log(f"режим {MODE}, эндпоинт {ENDPOINT}, ступени {RATES}, ступень {STAGE_MIN:g} мин, "
+            f"удержание {SUSTAIN_MIN:g} мин")
     R["ip"] = ip_info()
     log(f"внешний IP: {R['ip']}")
     if MODE == "ip":
@@ -370,6 +499,9 @@ def main():
         log("Steam не пропустил ни один клиент. Подожди 30–60 мин и запусти снова.")
         return
     if MODE == "check":
+        return
+    if MODE == "simulate":
+        simulate(fetch)
         return
 
     meter = Meter()
