@@ -291,6 +291,9 @@ def build_report():
     lines = [f"=== Steam capacity: {LABEL or R.get('ip', {}).get('ip', '?')} ==="]
     ipd = R.get("ip", {})
     lines.append(f"IP: {ipd.get('ip')} | {ipd.get('org')} | {ipd.get('city')}, {ipd.get('country')}")
+    ip_end = R.get("ip_end", {}).get("ip")
+    if ip_end and ip_end != ipd.get("ip"):
+        lines.append(f"ВНИМАНИЕ: IP сменился во время теста -> {ip_end}, результаты неточные")
     if "clients" in R:
         c = R["clients"]
         lines.append(f"urllib: {c['urllib'].get('result')} | curl: {c['curl'].get('result')}"
@@ -340,6 +343,8 @@ def send_telegram(text):
 
 
 def finish():
+    if MODE != "ip":
+        R["ip_end"] = ip_info()
     report = build_report()
     print("\n" + report, flush=True)
     R["duration_min"] = round((time.time() - T0) / 60)
