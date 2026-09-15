@@ -13,6 +13,10 @@
 | `check` | + какой клиент пропускает Steam (urllib / curl) | ~10 с | 2 |
 | `full` | + подъём частоты до 429, снятие лимита, удержание | ~40–90 мин | сотни |
 
+`ENDPOINT`: `search` (по умолчанию, `/market/search/render` — число лотов и цена) или
+`priceoverview`. Страницы `/market/listings/` Steam перевёл на новый движок, `item_nameid`
+в них больше нет, поэтому `itemordershistogram` не используется.
+
 Прочие переменные: `RATES`, `STAGE_MINUTES`, `SUSTAIN_MINUTES`,
 `MAX_RECOVERY_MINUTES`, `LOTS`, `LABEL`, `KEEP_ALIVE`, `TG_BOT_TOKEN`, `TG_CHAT_ID`
 (описание в начале `measure.py`).

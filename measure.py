@@ -5,7 +5,7 @@
 Что делает:
   1. Показывает внешний IP и провайдера (чтобы сравнить точки между собой).
   2. Проверяет, какой HTTP-клиент Steam пропускает: urllib (как requests) или curl.
-  3. Плавно поднимает частоту запросов к itemordershistogram, пока не придёт 429.
+  3. Плавно поднимает частоту запросов к выбранному эндпоинту, пока не придёт 429.
   4. Ждёт снятия ограничения и замеряет, сколько оно длится.
   5. Держит «безопасную» частоту SUSTAIN_MINUTES минут, чтобы подтвердить стабильность.
   6. Печатает отчёт и пересчёт в пользователей бота (опционально шлёт в Telegram).
@@ -15,6 +15,7 @@
 
 Переменные окружения (все необязательные):
   MODE                  ip | check | full            (по умолчанию full)
+  ENDPOINT              search | priceoverview       (search)
   RATES                 ступени, запросов/мин        (6,10,15,20,30,45,60)
   STAGE_MINUTES         длительность ступени         (4)
   SUSTAIN_MINUTES       проверка стабильности        (20)
@@ -23,14 +24,18 @@
   KEEP_ALIVE            1 = не завершаться после отчёта (для Northflank Service)
   TG_BOT_TOKEN, TG_CHAT_ID  прислать отчёт в Telegram
   LABEL                 имя точки в отчёте, например nf-1 / oracle-a1
+
+Эндпоинты:
+  search         /market/search/render?norender=1 — sell_listings и sell_price, один запрос на предмет.
+  priceoverview  /market/priceoverview — lowest_price и volume.
+(Страницы /market/listings/ с сентября 2026 на новом движке и item_nameid не содержат,
+ поэтому itemordershistogram больше не используется.)
 """
 import json
 import os
 import random
-import re
 import shutil
 import subprocess
-import sys
 import time
 import urllib.error
 import urllib.parse
@@ -50,7 +55,6 @@ ITEMS = [
 ]
 UA_BROWSER = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
               "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
-NAMEID_RE = re.compile(r"Market_LoadOrderSpread\(\s*(\d+)\s*\)")
 
 
 def env_float(name, default):
@@ -61,6 +65,7 @@ def env_float(name, default):
 
 
 MODE = os.getenv("MODE", "full").strip().lower()
+ENDPOINT = os.getenv("ENDPOINT", "search").strip().lower()
 RATES = [float(x) for x in os.getenv("RATES", "6,10,15,20,30,45,60").split(",") if x.strip()]
 STAGE_MIN = env_float("STAGE_MINUTES", 4)
 SUSTAIN_MIN = env_float("SUSTAIN_MINUTES", 20)
@@ -75,7 +80,7 @@ T0 = time.time()
 CURL = shutil.which("curl")
 
 # Всё, что попадёт в отчёт; заполняется по ходу, чтобы при остановке был частичный отчёт.
-R = {"label": LABEL, "mode": MODE, "stages": [], "sustain": []}
+R = {"label": LABEL, "mode": MODE, "endpoint": ENDPOINT, "stages": [], "sustain": []}
 
 
 def log(msg):
@@ -112,25 +117,16 @@ def fetch_curl(url, timeout=20):
     return status, body, time.time() - t
 
 
-def listing_url(name):
-    return f"https://steamcommunity.com/market/listings/{APPID}/{urllib.parse.quote(name)}"
+def endpoint_url(name):
+    if ENDPOINT == "priceoverview":
+        q = urllib.parse.urlencode({"appid": APPID, "currency": 1, "market_hash_name": name})
+        return f"https://steamcommunity.com/market/priceoverview/?{q}"
+    q = urllib.parse.urlencode({"query": name, "appid": APPID, "norender": 1, "count": 10,
+                                "search_descriptions": 0})
+    return f"https://steamcommunity.com/market/search/render/?{q}"
 
 
-def histogram_url(nameid):
-    q = urllib.parse.urlencode({"country": "US", "language": "english", "currency": 1,
-                                "item_nameid": nameid, "two_factor": 0})
-    return f"https://steamcommunity.com/market/itemordershistogram?{q}"
-
-
-def classify_listing(status, body):
-    if status == 429 or (status == 200 and body.strip() in ("", "null")):
-        return "limit"
-    if status == 200 and NAMEID_RE.search(body):
-        return "ok"
-    return "error" if status else "neterr"
-
-
-def classify_hist(status, body):
+def classify(status, body):
     if status == 429:
         return "limit"
     if status == 200:
@@ -140,8 +136,22 @@ def classify_hist(status, body):
             return "error"
         if data is None:  # Steam при ограничении отвечает телом null
             return "limit"
-        return "ok" if isinstance(data, dict) and data.get("success") == 1 else "error"
+        return "ok" if isinstance(data, dict) and data.get("success") in (True, 1) else "error"
     return "error" if status else "neterr"
+
+
+def describe(body, name):
+    """Короткая выжимка ответа для лога: убеждаемся, что данные настоящие."""
+    try:
+        data = json.loads(body)
+    except ValueError:
+        return ""
+    if ENDPOINT == "priceoverview":
+        return f"lowest={data.get('lowest_price')} volume={data.get('volume')}"
+    for item in data.get("results") or []:
+        if item.get("hash_name") == name:
+            return f"sell_listings={item.get('sell_listings')} price={item.get('sell_price_text')}"
+    return f"точного совпадения нет, результатов {data.get('total_count')}"
 
 
 # ---------------------------------------------------------------- шаги
@@ -159,53 +169,34 @@ def ip_info():
 
 
 def choose_client():
-    """Одна загрузка страницы предмета каждым клиентом. Возвращает (fetch, имя, nameid)."""
-    url = listing_url(ITEMS[0])
+    """По одному запросу каждым клиентом. Возвращает (fetch, имя)."""
+    name = ITEMS[0]
+    url = endpoint_url(name)
     checks = {}
 
     s, b, lat = fetch_urllib(url)
-    checks["urllib"] = {"status": s, "result": classify_listing(s, b), "latency": round(lat, 2)}
-    log(f"urllib: HTTP {s} -> {checks['urllib']['result']}")
-    nameid = NAMEID_RE.search(b).group(1) if checks["urllib"]["result"] == "ok" else None
+    checks["urllib"] = {"status": s, "result": classify(s, b), "latency": round(lat, 2)}
+    log(f"urllib: HTTP {s} -> {checks['urllib']['result']} {describe(b, name)}")
+    if checks["urllib"]["result"] == "error":
+        log(f"  тело: {b[:200]!r}")
 
     if CURL:
         time.sleep(6)
         s, b, lat = fetch_curl(url)
-        checks["curl"] = {"status": s, "result": classify_listing(s, b), "latency": round(lat, 2)}
-        log(f"curl:   HTTP {s} -> {checks['curl']['result']}")
-        if checks["curl"]["result"] == "ok":
-            nameid = NAMEID_RE.search(b).group(1)
+        checks["curl"] = {"status": s, "result": classify(s, b), "latency": round(lat, 2)}
+        log(f"curl:   HTTP {s} -> {checks['curl']['result']} {describe(b, name)}")
+        if checks["curl"]["result"] == "error":
+            log(f"  тело: {b[:200]!r}")
     else:
         checks["curl"] = {"result": "not installed"}
         log("curl не установлен, проверяю только urllib")
 
     R["clients"] = checks
     if checks["curl"].get("result") == "ok":
-        return fetch_curl, "curl", nameid
+        return fetch_curl, "curl"
     if checks["urllib"]["result"] == "ok":
-        return fetch_urllib, "urllib", nameid
-    return None, None, None
-
-
-def resolve_ids(fetch, first_id):
-    ids = {ITEMS[0]: first_id}
-    for name in ITEMS[1:]:
-        time.sleep(8)
-        for attempt in range(3):
-            s, b, _ = fetch(listing_url(name))
-            kind = classify_listing(s, b)
-            if kind == "ok":
-                ids[name] = NAMEID_RE.search(b).group(1)
-                break
-            if kind == "limit":
-                log(f"429 уже при загрузке страниц предметов, жду 5 мин (попытка {attempt + 1}/3)")
-                R.setdefault("notes", []).append("429 во время загрузки item_nameid")
-                time.sleep(300)
-            else:
-                log(f"не удалось получить item_nameid для {name}: HTTP {s}")
-                break
-    log(f"item_nameid получены для {len(ids)} предметов")
-    return list(ids.values())
+        return fetch_urllib, "urllib"
+    return None, None
 
 
 class Meter:
@@ -229,23 +220,23 @@ class Meter:
                 "last_10m": self.window(600), "last_60m": self.window(3600)}
 
 
-def run_rate(fetch, ids, rate, minutes, meter):
+def run_rate(fetch, rate, minutes, meter):
     interval = 60.0 / rate
     start = time.time()
     end = start + minutes * 60
     n = ok = err = 0
     lats = []
     next_t = start
-    i = random.randrange(len(ids))
+    i = random.randrange(len(ITEMS))
     while time.time() < end:
         now = time.time()
         if now < next_t:
             time.sleep(next_t - now)
-        s, b, lat = fetch(histogram_url(ids[i % len(ids)]))
+        s, b, lat = fetch(endpoint_url(ITEMS[i % len(ITEMS)]))
         i += 1
         meter.add()
         n += 1
-        kind = classify_hist(s, b)
+        kind = classify(s, b)
         if kind == "limit":
             elapsed = time.time() - start
             return "limit", {"rate": rate, "requests": n, "ok": ok, "errors": err,
@@ -267,7 +258,7 @@ def run_rate(fetch, ids, rate, minutes, meter):
                   "avg_latency": round(sum(lats) / len(lats), 2) if lats else None}
 
 
-def recover(fetch, nameid, meter):
+def recover(fetch, meter):
     """Редкие пробы с растущей паузой: частые повторы только продлевают ограничение."""
     waited = 0.0
     for pause in [2, 4, 8, 15, 15, 15, 15, 15]:
@@ -276,9 +267,9 @@ def recover(fetch, nameid, meter):
         log(f"  жду {pause} мин и пробую снова (всего ждём {waited + pause:.0f} мин)")
         time.sleep(pause * 60)
         waited += pause
-        s, b, _ = fetch(histogram_url(nameid))
+        s, b, _ = fetch(endpoint_url(ITEMS[0]))
         meter.add()
-        if classify_hist(s, b) == "ok":
+        if classify(s, b) == "ok":
             log(f"  ограничение снято, прошло не больше {waited:.0f} мин")
             return waited
     log(f"  за {MAX_RECOVERY_MIN:.0f} мин ограничение не снялось")
@@ -288,7 +279,7 @@ def recover(fetch, nameid, meter):
 # ---------------------------------------------------------------- отчёт
 
 def build_report():
-    lines = [f"=== Steam capacity: {LABEL or R.get('ip', {}).get('ip', '?')} ==="]
+    lines = [f"=== Steam capacity: {LABEL or R.get('ip', {}).get('ip', '?')} ({ENDPOINT}) ==="]
     ipd = R.get("ip", {})
     lines.append(f"IP: {ipd.get('ip')} | {ipd.get('org')} | {ipd.get('city')}, {ipd.get('country')}")
     ip_end = R.get("ip_end", {}).get("ip")
@@ -296,8 +287,9 @@ def build_report():
         lines.append(f"ВНИМАНИЕ: IP сменился во время теста -> {ip_end}, результаты неточные")
     if "clients" in R:
         c = R["clients"]
-        lines.append(f"urllib: {c['urllib'].get('result')} | curl: {c['curl'].get('result')}"
-                     f" | выбран: {R.get('client')}")
+        lines.append(f"urllib: {c['urllib'].get('result')} (HTTP {c['urllib'].get('status')}) | "
+                     f"curl: {c['curl'].get('result')} (HTTP {c['curl'].get('status')}) | "
+                     f"выбран: {R.get('client')}")
     for st in R["stages"]:
         if st["result"] == "ok":
             lines.append(f"  ступень {st['rate']:g}/мин: OK ({st['requests']} запр., "
@@ -359,13 +351,14 @@ def finish():
 # ---------------------------------------------------------------- main
 
 def main():
-    log(f"режим {MODE}, ступени {RATES}, ступень {STAGE_MIN:g} мин, удержание {SUSTAIN_MIN:g} мин")
+    log(f"режим {MODE}, эндпоинт {ENDPOINT}, ступени {RATES}, ступень {STAGE_MIN:g} мин, "
+        f"удержание {SUSTAIN_MIN:g} мин")
     R["ip"] = ip_info()
     log(f"внешний IP: {R['ip']}")
     if MODE == "ip":
         return
 
-    fetch, client, first_id = choose_client()
+    fetch, client = choose_client()
     R["client"] = client
     if not fetch:
         R["notes"] = ["Ни один клиент не прошёл: IP уже ограничен или клиенты заблокированы"]
@@ -374,14 +367,13 @@ def main():
     if MODE == "check":
         return
 
-    ids = resolve_ids(fetch, first_id)
     meter = Meter()
     last_ok = None
     limit_hit = False
 
     for rate in RATES:
         log(f"ступень {rate:g} запр/мин на {STAGE_MIN:g} мин")
-        res, st = run_rate(fetch, ids, rate, STAGE_MIN, meter)
+        res, st = run_rate(fetch, rate, STAGE_MIN, meter)
         st["result"] = res
         R["stages"].append(st)
         if res == "ok":
@@ -396,7 +388,7 @@ def main():
             break
 
     if limit_hit:
-        R["recovery_min"] = recover(fetch, ids[0], meter)
+        R["recovery_min"] = recover(fetch, meter)
         if R["recovery_min"] is None:
             return
         sustain_rate = (last_ok if last_ok else RATES[0] / 2) * 0.75
@@ -408,7 +400,7 @@ def main():
 
     for attempt in range(2):
         log(f"удержание {sustain_rate:.1f} запр/мин на {SUSTAIN_MIN:g} мин (попытка {attempt + 1}/2)")
-        res, st = run_rate(fetch, ids, sustain_rate, SUSTAIN_MIN, meter)
+        res, st = run_rate(fetch, sustain_rate, SUSTAIN_MIN, meter)
         st["result"] = res
         R["sustain"].append(st)
         if res == "ok":
@@ -417,7 +409,7 @@ def main():
             break
         if res == "limit":
             log(f"  429 на удержании через {st['seconds_until_429']}с")
-            R["recovery_min_sustain"] = recover(fetch, ids[0], meter)
+            R["recovery_min_sustain"] = recover(fetch, meter)
             if R["recovery_min_sustain"] is None:
                 break
             sustain_rate *= 0.6
