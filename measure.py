@@ -15,7 +15,7 @@
 
 Переменные окружения (все необязательные):
   MODE                  ip | check | full            (по умолчанию full)
-  ENDPOINT              search | priceoverview       (search)
+  ENDPOINT              search | priceoverview | mixed (search; mixed = по очереди оба)
   RATES                 ступени, запросов/мин        (6,10,15,20,30,45,60)
   STAGE_MINUTES         длительность ступени         (4)
   SUSTAIN_MINUTES       проверка стабильности        (20)
@@ -117,8 +117,8 @@ def fetch_curl(url, timeout=20):
     return status, body, time.time() - t
 
 
-def endpoint_url(name):
-    if ENDPOINT == "priceoverview":
+def endpoint_url(name, kind=None):
+    if (kind or ENDPOINT) == "priceoverview":
         q = urllib.parse.urlencode({"appid": APPID, "currency": 1, "market_hash_name": name})
         return f"https://steamcommunity.com/market/priceoverview/?{q}"
     q = urllib.parse.urlencode({"query": name, "appid": APPID, "norender": 1, "count": 10,
@@ -146,7 +146,9 @@ def describe(body, name):
         data = json.loads(body)
     except ValueError:
         return ""
-    if ENDPOINT == "priceoverview":
+    if not isinstance(data, dict):
+        return ""
+    if "results" not in data:
         return f"lowest={data.get('lowest_price')} volume={data.get('volume')}"
     for item in data.get("results") or []:
         if item.get("hash_name") == name:
@@ -232,7 +234,9 @@ def run_rate(fetch, rate, minutes, meter):
         now = time.time()
         if now < next_t:
             time.sleep(next_t - now)
-        s, b, lat = fetch(endpoint_url(ITEMS[i % len(ITEMS)]))
+        # mixed: по очереди search и priceoverview — проверяем, общий ли у них лимит
+        ep = ("search" if i % 2 == 0 else "priceoverview") if ENDPOINT == "mixed" else ENDPOINT
+        s, b, lat = fetch(endpoint_url(ITEMS[i % len(ITEMS)], ep))
         i += 1
         meter.add()
         n += 1
@@ -240,7 +244,7 @@ def run_rate(fetch, rate, minutes, meter):
         if kind == "limit":
             elapsed = time.time() - start
             return "limit", {"rate": rate, "requests": n, "ok": ok, "errors": err,
-                             "seconds_until_429": round(elapsed), "http": s,
+                             "seconds_until_429": round(elapsed), "http": s, "endpoint_at_429": ep,
                              "windows_at_429": meter.snapshot()}
         if kind == "ok":
             ok += 1
@@ -252,7 +256,7 @@ def run_rate(fetch, rate, minutes, meter):
                 return "error", {"rate": rate, "requests": n, "ok": ok, "errors": err}
         next_t += interval * random.uniform(0.85, 1.15)
         next_t = max(next_t, time.time())  # не догоняем пачкой, если отстали
-    elapsed = time.time() - start
+    elapsed = max(time.time() - start, 1e-6)
     return "ok", {"rate": rate, "requests": n, "ok": ok, "errors": err,
                   "actual_rate": round(n / elapsed * 60, 1),
                   "avg_latency": round(sum(lats) / len(lats), 2) if lats else None}
@@ -296,7 +300,8 @@ def build_report():
                          f"факт {st['actual_rate']}/мин, задержка {st['avg_latency']}с)")
         elif st["result"] == "limit":
             w = st["windows_at_429"]
-            lines.append(f"  ступень {st['rate']:g}/мин: 429 через {st['seconds_until_429']}с "
+            lines.append(f"  ступень {st['rate']:g}/мин: 429 ({st.get('endpoint_at_429')}) "
+                         f"через {st['seconds_until_429']}с "
                          f"(за 1м {w['last_1m']}, 5м {w['last_5m']}, 10м {w['last_10m']}, "
                          f"60м {w['last_60m']} запр.)")
         else:
@@ -397,6 +402,10 @@ def main():
             return
         sustain_rate = last_ok
         R["limit_not_reached"] = True
+
+    if SUSTAIN_MIN <= 0:
+        log("удержание отключено (SUSTAIN_MINUTES=0)")
+        return
 
     for attempt in range(2):
         log(f"удержание {sustain_rate:.1f} запр/мин на {SUSTAIN_MIN:g} мин (попытка {attempt + 1}/2)")
